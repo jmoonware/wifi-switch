@@ -47,6 +47,13 @@ class response_pico_thp(Enum):
 	def __str__(self):
 		return(self.name)
 
+class response_switch_state(Enum):
+	switch1_state = auto()
+	switch2_state = auto()
+	switch3_state  = auto()
+	def __str__(self):
+		return(self.name)
+
 class response_pico_status(Enum):
 	uptime_s = auto()
 	board_T_C = auto()
