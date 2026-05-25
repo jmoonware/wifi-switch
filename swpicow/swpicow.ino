@@ -2,13 +2,14 @@
 #include <NTPClient.h>
 #include <AsyncUDP_RP2040W.h>
 #include <Adafruit_BME280.h>
+#include <hardware/watchdog.h>
 
 // secret, contains definition of local_ssid, local_pass, and data_url in three lines, literally: 
 // char local_ssid[] = "NNN";  //  your network SSID (name)
 // char local_pass[] = "PPP";  // your network password
-#include "/home/jmoon/Arduino/libraries/local/ssid_harvest.h"
-IPAddress static_ip(192,168,1,11);
-IPAddress static_dns(192,168,1,2);
+#include "/home/jmoon/Arduino/libraries/local/ssid.h"
+IPAddress static_ip(192,168,1,247);
+IPAddress static_dns(192,168,1,253);
 IPAddress static_gateway(192,168,1,1);
 IPAddress static_subnet(255,255,255,0);
 
@@ -22,6 +23,7 @@ char version[] = "202512261";
 WiFiUDP ntpUDP;
 NTPClient theNTPUDPClient(ntpUDP);
 DateTimeNTP dtntp(&theNTPUDPClient);
+
 int wifi_status = WL_IDLE_STATUS;     // the Wifi radio's status
 
 // UDP stuff
@@ -35,13 +37,16 @@ unsigned char outgoing_packet_buf[OUTGOING_UDP_PACKET_SZ];
 
 elapsedMillis update_millis;
 elapsedMillis bme_update_millis;
+elapsedMillis wifi_millis;
 
 uint32_t update_delay = 1*1000; // ms, for raw sensor data
 uint32_t bme_update_delay = 60*1000; // ms, for BME T/H/P sensors
+uint32_t wifi_update_delay = 60*1000; // ms, for checking if we need to attempt a reconnect
 
 enum GIZMO_STATES {
   STATE_UPDATE,
   STATE_UPDATE_TEMP,
+  STATE_CHECK_WIFI,
   STATE_WAIT
 };
 uint8_t gizmo_state;
@@ -52,6 +57,7 @@ enum GIZMO_ERRORS {
   ERROR_NTP_INIT = 1,
   ERROR_BMEA_INIT = 2,
   ERROR_BMEB_INIT = 4,
+  ERROR_WATCHDOG_REBOOT = 8, 
 };
 static uint16_t gizmo_error_reg = 0;
 
@@ -80,6 +86,7 @@ void read_bme280()
   // Otherwise, it is continuously updating the registers with t_sb delay
   // the Adafruit lib defaults to 250 ms delay, which is enough to heat 
   // the sensor
+
   if(theBME280A.takeForcedMeasurement()) {
     last_bme280a_temperature = theBME280A.readTemperature();
     last_bme280a_humidity = theBME280A.readHumidity();
@@ -323,6 +330,55 @@ void parsePacket(AsyncUDPPacket packet) {
 // SCL = D1, physical pin 2
 TwoWire theWire(i2c0,D0,D1);
 
+
+// checks wifi status and attempts reconnect if necessary
+// called on wifi_millis interval
+
+#define NTP_RETRIES 3 
+
+void check_wifi() {
+
+  wifi_status = WiFi.status();
+
+  while (wifi_status != WL_CONNECTED) {
+    WiFi.config(static_ip,static_dns, static_gateway,static_subnet);
+    wifi_status = WiFi.begin(local_ssid,local_pass);
+    digitalWrite(PIN_LED, HIGH);
+    delay(100);
+    digitalWrite(PIN_LED, LOW);
+    // wait for connection:
+    delay(1000);
+  }
+
+  // start the date time NTP updates
+  // TODO: enable restart via a UDP command 
+
+  uint8_t retries = 0;
+  while (!dtntp.start() && retries < NTP_RETRIES) {
+    wifi_status = WiFi.disconnect();
+    while (wifi_status != WL_CONNECTED) {
+      WiFi.config(static_ip,static_dns, static_gateway,static_subnet);
+      wifi_status = WiFi.begin(local_ssid,local_pass);
+      // wait for connection:
+      delay(1000);
+    }
+    delay(1000);
+    retries+=1;
+  }
+  if (retries==NTP_RETRIES) {
+    gizmo_error_reg|=ERROR_NTP_INIT;
+    // quick blinks for failure
+    for (int i=0; i < 2; ++i) {
+      digitalWrite(PIN_LED, HIGH);
+      delay(200);
+      digitalWrite(PIN_LED, LOW);
+      delay(200);
+    }
+    delay(1000);
+  }
+
+}
+
 /////////////////////////////////////////
 // SETUP
 /////////////////////////////////////////
@@ -344,45 +400,13 @@ void setup() {
   pinMode(SWITCH3_PIN,OUTPUT);
   digitalWrite(SWITCH3_PIN, LOW);
 
-  while (wifi_status != WL_CONNECTED) {
-    WiFi.config(static_ip,static_dns, static_gateway,static_subnet);
-    wifi_status = WiFi.begin(local_ssid,local_pass);
-    digitalWrite(PIN_LED, HIGH);
-    delay(100);
-    digitalWrite(PIN_LED, LOW);
-    // wait for connection:
-    delay(1000);
-  }
-
-  // start the date time NTP updates
-  #define NTP_RETRIES 3 
-  uint8_t retries = 0;
-  while (!dtntp.start() && retries < NTP_RETRIES) {
-    wifi_status = WiFi.disconnect();
-    while (wifi_status != WL_CONNECTED) {
-      WiFi.config(static_ip,static_dns, static_gateway,static_subnet);
-      wifi_status = WiFi.begin(local_ssid,local_pass);
-      // wait for connection:
-      delay(1000);
-    }
-    delay(1000);
-    retries+=1;
-  }
-  if (retries==NTP_RETRIES) {
-    gizmo_error_reg|=ERROR_NTP_INIT;
-    // quick blinks for BME failure
-    for (int i=0; i < 2; ++i) {
-      digitalWrite(PIN_LED, HIGH);
-      delay(200);
-      digitalWrite(PIN_LED, LOW);
-      delay(200);
-    }
-    delay(1000);
-  }
+ 
+  check_wifi();
 
   // reset loop update clock
   update_millis = 0;
   bme_update_millis = bme_update_delay;
+  wifi_millis = 0;
 
   // set up UDP listen and callback 
   if(udp.listen(UDP_LISTEN_PORT)) {
@@ -445,6 +469,14 @@ void setup() {
     theBME280B.setSampling(Adafruit_BME280::sensor_mode::MODE_FORCED,Adafruit_BME280::SAMPLING_X1,Adafruit_BME280::SAMPLING_X1,Adafruit_BME280::SAMPLING_X1);
   }
 
+  // finally, enable watchdog timer; if it hasn't been updated in 5 s then something is wrong and time to reboot
+  watchdog_enable(5000, false);
+  // this will be set if we were rebooted through the watchdog 
+  if (watchdog_enable_caused_reboot()) {
+    gizmo_error_reg |= ERROR_WATCHDOG_REBOOT;
+  }
+
+
   // two long blinks for init finish
   for (int i=0; i < 2; ++i) {
     digitalWrite(PIN_LED, HIGH);
@@ -462,7 +494,11 @@ void setup() {
 
 void loop() {
 
-  if (update_millis > update_delay) {
+  watchdog_update();
+  if (wifi_millis > wifi_update_delay) {
+      gizmo_state = STATE_CHECK_WIFI;
+  }
+  else if (update_millis > update_delay) {
       gizmo_state = STATE_UPDATE;
   }
   else if (bme_update_millis >= bme_update_delay) {
@@ -474,6 +510,13 @@ void loop() {
 
 
   switch (gizmo_state) {
+    case STATE_CHECK_WIFI:
+    {
+      wifi_millis = 0;
+      // make sure wifi is still connected
+      check_wifi();
+      break;
+    }
     case STATE_UPDATE:
     {
       update_millis = 0;
@@ -484,8 +527,8 @@ void loop() {
     }
     case STATE_UPDATE_TEMP:
     {
-      read_bme280();
       bme_update_millis=0;
+      read_bme280();
       break;
     }
     case STATE_WAIT:
